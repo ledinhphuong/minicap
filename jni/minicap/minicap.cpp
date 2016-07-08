@@ -28,6 +28,8 @@
 #define DEFAULT_DISPLAY_ID 0
 #define DEFAULT_JPG_QUALITY 80
 
+#define BUFSIZE 1024
+
 enum {
   QUIRK_DUMB            = 1,
   QUIRK_ALWAYS_UPRIGHT  = 2,
@@ -42,6 +44,17 @@ usage(const char* pname) {
     "  -n <name>:     Change the name of the abtract unix domain socket. (%s)\n"
     "  -P <value>:    Display projection (<w>x<h>@<w>x<h>/{0|90|180|270}).\n"
     "  -s:            Take a screenshot and output it to stdout. Needs -P.\n"
+    /*
+      By default, minicap will run as a stream server which automatically streams data
+      over socket when any socket connects to. That's too much when we only need
+      a screenshot at a time. -s can help but it overheats ADB since all data transferred
+      via ADB (shell command and screenshot data). -C is introduced to fill this gap.
+      It gives us screenshots when we want and transfer screenshots via TCP socket instead of ADB.
+
+      When running in this mode, minicap server will hold and wait for a command to take screenshot,
+      that gets rid of the useless cost. To use TCP connection, so the pressure on ADB is reduced.
+     */
+    "  -C:            Take screenshot on demand and send via socket.\n"
     "  -S:            Skip frames when they cannot be consumed quickly enough.\n"
     "  -t:            Attempt to get the capture method running, then exit.\n"
     "  -i:            Get display information in JSON format. May segfault.\n"
@@ -210,12 +223,13 @@ main(int argc, char* argv[]) {
   unsigned int quality = DEFAULT_JPG_QUALITY;
   bool showInfo = false;
   bool takeScreenshot = false;
+  bool waitForCommand = false;
   bool skipFrames = false;
   bool testOnly = false;
   Projection proj;
 
   int opt;
-  while ((opt = getopt(argc, argv, "d:n:P:siSth")) != -1) {
+  while ((opt = getopt(argc, argv, "d:n:P:CsiSth")) != -1) {
     switch (opt) {
     case 'd':
       displayId = atoi(optarg);
@@ -231,6 +245,9 @@ main(int argc, char* argv[]) {
       }
       break;
     }
+    case 'C':
+      waitForCommand = true;
+      break;
     case 's':
       takeScreenshot = true;
       break;
@@ -440,12 +457,70 @@ main(int argc, char* argv[]) {
   banner[23] = quirks;
 
   int fd;
+  char buf[BUFSIZE]; /* message buffer */
   while (!gWaiter.isStopped() && (fd = server.accept()) > 0) {
     MCINFO("New client connection");
 
     if (pumps(fd, banner, BANNER_SIZE) < 0) {
       close(fd);
       continue;
+    }
+
+    MCINFO("FD: %d", fd);
+
+    // waits for a message from client to capture screenshot
+    if (waitForCommand) {
+      while (!gWaiter.isStopped()) {
+        bzero(buf, BUFSIZE); // Cleans buffer
+
+        // Read message from socket
+        if (read(fd, buf, BUFSIZE) < 0) {
+          MCERROR("Unable to read from socket");
+          goto close;
+        }
+
+        // Compare client message
+        if (strcmp(buf, "take-screenshot") == 0) {
+          // Wait until pending frame is transferred completely
+          if (!gWaiter.waitForFrame()) {
+            MCERROR("Unable to wait for frame");
+            goto disaster;
+          }
+
+          int err;
+
+          // Fulfill frame data
+          if ((err = minicap->consumePendingFrame(&frame)) != 0) {
+            MCERROR("Unable to consume pending frame");
+            goto disaster;
+          }
+
+          haveFrame = true;
+
+          if (!encoder.encode(&frame, quality)) {
+            MCERROR("Unable to encode frame");
+            goto disaster;
+          }
+
+          unsigned char* data = encoder.getEncodedData() - 4;
+          size_t size = encoder.getEncodedSize();
+
+          // Add size of image to frame header
+          putUInt32LE(data, size);
+
+          // Send frame data to client
+          if (pumps(fd, data, size + 4) < 0) {
+            break;
+          }
+
+          minicap->releaseConsumedFrame(&frame);
+          haveFrame = false;
+        }
+        else {
+          MCINFO("No command found for %s", buf);
+          goto close;
+        }
+      }
     }
 
     int pending, err;
