@@ -21,9 +21,6 @@
 #include "SimpleServer.hpp"
 #include "Projection.hpp"
 
-#define BANNER_VERSION 1
-#define BANNER_SIZE 24
-
 #define DEFAULT_SOCKET_NAME "minicap"
 #define DEFAULT_DISPLAY_ID 0
 #define DEFAULT_JPG_QUALITY 80
@@ -69,6 +66,11 @@ public:
     : mPendingFrames(0),
       mTimeout(std::chrono::milliseconds(100)),
       mStopped(false) {
+  }
+
+  int
+  pendingFrames() {
+    return mPendingFrames;
   }
 
   int
@@ -444,32 +446,19 @@ main(int argc, char* argv[]) {
     goto disaster;
   }
 
-  // Prepare banner for clients.
-  unsigned char banner[BANNER_SIZE];
-  banner[0] = (unsigned char) BANNER_VERSION;
-  banner[1] = (unsigned char) BANNER_SIZE;
-  putUInt32LE(banner + 2, getpid());
-  putUInt32LE(banner + 6,  realInfo.width);
-  putUInt32LE(banner + 10,  realInfo.height);
-  putUInt32LE(banner + 14, desiredInfo.width);
-  putUInt32LE(banner + 18, desiredInfo.height);
-  banner[22] = (unsigned char) desiredInfo.orientation;
-  banner[23] = quirks;
-
   int fd;
   char buf[BUFSIZE]; /* message buffer */
   while (!gWaiter.isStopped() && (fd = server.accept()) > 0) {
     MCINFO("New client connection");
 
-    if (pumps(fd, banner, BANNER_SIZE) < 0) {
-      close(fd);
-      continue;
-    }
-
     MCINFO("FD: %d", fd);
 
     // waits for a message from client to capture screenshot
     if (waitForCommand) {
+      // Uses to temporarily store image data
+      unsigned char* data;
+      size_t size;
+
       while (!gWaiter.isStopped()) {
         bzero(buf, BUFSIZE); // Cleans buffer
 
@@ -481,7 +470,20 @@ main(int argc, char* argv[]) {
 
         // Compare client message
         if (strcmp(buf, "take-screenshot") == 0) {
-          // Wait until pending frame is transferred completely
+
+          // Minicap listens to onFrameAvailable to know if there's any frame buffer to consume.
+          // There's a chance to have an empty frame when receiving take-screenshot command.
+          // That case can be detected via pendingFrames and we will re-send the previous 
+          // screenshot if there's not frame in buffer.
+          if (!gWaiter.pendingFrames()) {
+            if (pumps(fd, data, size + 4) < 0) {
+              MCERROR("Unable to send frame");
+              break;
+            }
+            continue;
+          }
+
+          // Wait until new frame is updated in Android OS
           if (!gWaiter.waitForFrame()) {
             MCERROR("Unable to wait for frame");
             goto disaster;
@@ -502,25 +504,30 @@ main(int argc, char* argv[]) {
             goto disaster;
           }
 
-          unsigned char* data = encoder.getEncodedData() - 4;
-          size_t size = encoder.getEncodedSize();
+          data = encoder.getEncodedData() - 4;
+          size = encoder.getEncodedSize();
 
           // Add size of image to frame header
           putUInt32LE(data, size);
 
           // Send frame data to client
           if (pumps(fd, data, size + 4) < 0) {
+            MCERROR("Unable to send frame");
             break;
           }
 
+          // Releases consumed frame first to ensure no pending frame
           minicap->releaseConsumedFrame(&frame);
           haveFrame = false;
+
+          
         }
         else {
           MCINFO("No command found for %s", buf);
           goto close;
         }
       }
+      goto close;
     }
 
     int pending, err;
